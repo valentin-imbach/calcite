@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -16,29 +16,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-
-// Convert time to superscript format: "12:30" -> "12³⁰"
-fn format_time_superscript(time: NaiveTime) -> String {
-    let hour = time.hour();
-    let minute = time.minute();
-    let minute_str = format!("{:02}", minute);
-    let superscript_minute = minute_str.chars()
-        .map(|c| match c {
-            '0' => '⁰',
-            '1' => '¹',
-            '2' => '²',
-            '3' => '³',
-            '4' => '⁴',
-            '5' => '⁵',
-            '6' => '⁶',
-            '7' => '⁷',
-            '8' => '⁸',
-            '9' => '⁹',
-            _ => c,
-        })
-        .collect::<String>();
-    format!("{}{}", hour, superscript_minute)
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum EventCategory {
@@ -388,6 +365,7 @@ enum InputMode {
     Normal,
     EventPopup,
     DeletingEvent(usize), // Index of event to delete (showing confirmation)
+    ShowingInfo,
 }
 
 struct EventForm {
@@ -1150,6 +1128,9 @@ fn run_app<B: ratatui::backend::Backend>(
                         app.show_delete_numbers = !app.show_delete_numbers;
                         app.show_event_numbers = false;
                     }
+                    KeyCode::Char('i') => {
+                        app.input_mode = InputMode::ShowingInfo;
+                    }
                     KeyCode::Char(c) if c.is_ascii_digit() && app.show_event_numbers => {
                         let digit = c.to_digit(10).unwrap() as usize;
                         let events = app.get_sorted_events(&app.selected_date);
@@ -1343,6 +1324,14 @@ fn run_app<B: ratatui::backend::Backend>(
                         _ => {}
                     }
                 }
+                InputMode::ShowingInfo => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                            app.input_mode = InputMode::Normal;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -1351,11 +1340,17 @@ fn run_app<B: ratatui::backend::Backend>(
 fn ui(f: &mut ratatui::Frame, app: &App) {
     let size = f.area();
     
-    // Split into two columns
+    // Split into main area and footer
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(size);
+    
+    // Split main area into two columns
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(size);
+        .split(main_chunks[0]);
     
     // Left column: Calendar
     render_calendar(f, app, chunks[0]);
@@ -1363,11 +1358,19 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     // Right column: Selected date info
     render_date_info(f, app, chunks[1]);
     
+    // Render footer with keybinding hints
+    let footer_text = " a: add event | e: edit | r: remove | Space: today | i: info | q: quit ";
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(footer, main_chunks[1]);
+    
     // Render popup if in input mode
     if app.input_mode == InputMode::EventPopup {
         render_event_popup(f, app);
     } else if let InputMode::DeletingEvent(index) = app.input_mode {
         render_delete_confirmation(f, app, index);
+    } else if app.input_mode == InputMode::ShowingInfo {
+        render_info_popup(f, app);
     }
 }
 
@@ -1576,12 +1579,12 @@ fn render_date_info(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
                     start.format("%H:%M").to_string()
                 }
             } else {
-                "All day".to_string()
+                String::new()
             };
             
             rows.push(Row::new(vec![
                 number_cell,
-                Cell::from(time_str).style(Style::default().fg(Color::Yellow)),
+                Cell::from(time_str).style(Style::default().fg(Color::White)),
                 Cell::from(event.name.as_str()).style(Style::default().fg(event.category.color(&app.config))),
             ]));
             
@@ -1938,3 +1941,81 @@ fn render_delete_confirmation(f: &mut ratatui::Frame, app: &App, event_index: us
     
     f.render_widget(paragraph, popup_area);
 }
+
+fn render_info_popup(f: &mut ratatui::Frame, app: &App) {
+    use ratatui::text::{Line, Span};
+    
+    let area = f.area();
+    
+    // Calculate popup size (centered)
+    let popup_width = 60.min(area.width - 4);
+    let popup_height = 15.min(area.height - 4);
+    let popup_x = (area.width - popup_width) / 2;
+    let popup_y = (area.height - popup_height) / 2;
+    
+    let popup_area = ratatui::layout::Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+    
+    // Get paths
+    let events_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("events.toml")
+        .display()
+        .to_string();
+    let config_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("config.toml")
+        .display()
+        .to_string();
+    
+    // Clear the area behind the popup to prevent bleed-through
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+    
+    // Build info text
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Version: ", Style::default().fg(Color::Gray)),
+            Span::raw("0.1.0-alpha"),
+        ]),
+        Line::from(vec![
+            Span::styled("Local Events: ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{}", app.local_events.len())),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("ICS Calendars: ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{}", app.config.ics_calendars.len())),
+        ]),
+        Line::from(vec![
+            Span::styled("External Events: ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{}", app.external_events.len())),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Events Path: ", Style::default().fg(Color::Gray)),
+            Span::raw(events_path),
+        ]),
+        Line::from(vec![
+            Span::styled("Config Path: ", Style::default().fg(Color::Gray)),
+            Span::raw(config_path),
+        ]),
+    ];
+    
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Info (ESC to close) ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Reset).fg(Color::White))
+                .padding(ratatui::widgets::Padding::uniform(1))
+        );
+    
+    f.render_widget(paragraph, popup_area);
+}
+
+
