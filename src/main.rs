@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 
 #[derive(Clone, Copy, PartialEq)]
 enum EventCategory {
@@ -67,6 +69,18 @@ struct Config {
     categories: Vec<CategoryConfig>,
     #[serde(default)]
     ics_calendars: Vec<IcsCalendar>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_year: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_year: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export_path: Option<String>,
+    #[serde(default = "default_timezone")]
+    timezone: String,
+}
+
+fn default_timezone() -> String {
+    "Europe/Zurich".to_string()
 }
 
 impl Config {
@@ -100,6 +114,10 @@ impl Default for Config {
                 CategoryConfig { name: "Other".to_string(), color: "Gray".to_string() },
             ],
             ics_calendars: vec![],
+            min_year: None,
+            max_year: None,
+            export_path: None,
+            timezone: default_timezone(),
         }
     }
 }
@@ -111,7 +129,7 @@ fn fetch_ics_events(config: &Config) -> Vec<CalendarEvent> {
         if let Some(category) = EventCategory::from_number(ics_calendar.category) {
             if let Ok(response) = reqwest::blocking::get(&ics_calendar.url) {
                 if let Ok(content) = response.text() {
-                    if let Ok(events) = parse_ics_content(&content, category) {
+                    if let Ok(events) = parse_ics_content(&content, category, config.min_year, config.max_year) {
                         external_events.extend(events);
                     }
                 }
@@ -122,7 +140,7 @@ fn fetch_ics_events(config: &Config) -> Vec<CalendarEvent> {
     external_events
 }
 
-fn parse_ics_content(content: &str, category: EventCategory) -> Result<Vec<CalendarEvent>, Box<dyn std::error::Error>> {
+fn parse_ics_content(content: &str, category: EventCategory, min_year: Option<i32>, max_year: Option<i32>) -> Result<Vec<CalendarEvent>, Box<dyn std::error::Error>> {
     let reader = ical::IcalParser::new(content.as_bytes());
     let mut events = Vec::new();
     
@@ -164,17 +182,44 @@ fn parse_ics_content(content: &str, category: EventCategory) -> Result<Vec<Calen
             }
             
             if !name.is_empty() && dtstart.is_some() {
-                let event = CalendarEvent {
-                    name,
-                    date: dtstart.unwrap(),
-                    end_date: dtend,
-                    time: start_time,
-                    end_time,
-                    category,
-                    repeat: RepeatInterval::Daily,
-                    number: None,
+                let date = dtstart.unwrap();
+                let event_year = date.year();
+                
+                // Filter by year range if specified
+                let in_range = match (min_year, max_year) {
+                    (Some(min), Some(max)) => event_year >= min && event_year <= max,
+                    (Some(min), None) => event_year >= min,
+                    (None, Some(max)) => event_year <= max,
+                    (None, None) => true, // No filtering
                 };
-                events.push(event);
+                
+                if in_range {
+                    // For all-day events, DTEND is exclusive in ICS format
+                    // Subtract one day if dtend exists and there's no time component
+                    let adjusted_end_date = if let Some(end_date) = dtend {
+                        if end_time.is_none() && start_time.is_none() {
+                            // All-day event: DTEND is exclusive, so subtract 1 day
+                            Some(end_date - chrono::Days::new(1))
+                        } else {
+                            // Timed event: DTEND is inclusive
+                            Some(end_date)
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    let event = CalendarEvent {
+                        name,
+                        date,
+                        end_date: adjusted_end_date,
+                        time: start_time,
+                        end_time,
+                        category,
+                        repeat: RepeatInterval::Daily,
+                        number: None,
+                    };
+                    events.push(event);
+                }
             }
         }
     }
@@ -358,6 +403,7 @@ struct App {
     show_event_numbers: bool,
     show_delete_numbers: bool,
     config: Config,
+    search_state: SearchState,
 }
 
 #[derive(PartialEq)]
@@ -366,6 +412,226 @@ enum InputMode {
     EventPopup,
     DeletingEvent(usize), // Index of event to delete (showing confirmation)
     ShowingInfo,
+    Searching,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum SearchMode {
+    Future,
+    Past,
+    All,
+}
+
+impl SearchMode {
+    fn next(&self) -> Self {
+        match self {
+            SearchMode::Future => SearchMode::Past,
+            SearchMode::Past => SearchMode::All,
+            SearchMode::All => SearchMode::Future,
+        }
+    }
+    
+    fn to_string(&self) -> &str {
+        match self {
+            SearchMode::Future => "Future",
+            SearchMode::Past => "Past",
+            SearchMode::All => "All",
+        }
+    }
+}
+
+struct SearchState {
+    query: String,
+    results: Vec<SearchResult>,
+    selected_index: usize,
+    mode: SearchMode,
+}
+
+struct SearchResult {
+    event_name: String,
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    source: EventSource,
+    score: i64,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        SearchState {
+            query: String::new(),
+            results: Vec::new(),
+            selected_index: 0,
+            mode: SearchMode::Future,
+        }
+    }
+    
+    fn cycle_mode(&mut self) {
+        self.mode = self.mode.next();
+        self.selected_index = 0;
+    }
+    
+    fn update_results(&mut self, local_events: &[CalendarEvent], external_events: &[CalendarEvent], config: &Config) {
+        self.results.clear();
+        self.selected_index = 0;
+        
+        if self.query.is_empty() {
+            return;
+        }
+        
+        let matcher = SkimMatcherV2::default();
+        let now = Local::now().date_naive();
+        
+        // Search through local events
+        for (idx, event) in local_events.iter().enumerate() {
+            // Filter by mode first
+            let include = match self.mode {
+                SearchMode::Future => event.date >= now,
+                SearchMode::Past => event.date < now,
+                SearchMode::All => true,
+            };
+            
+            if !include {
+                continue;
+            }
+            
+            // Build searchable text with metadata
+            let mut searchable_text = event.name.clone();
+            
+            // Add category name
+            searchable_text.push(' ');
+            searchable_text.push_str(event.category.name(config));
+            
+            // Add date
+            searchable_text.push(' ');
+            searchable_text.push_str(&event.date.format("%Y-%m-%d").to_string());
+            searchable_text.push(' ');
+            searchable_text.push_str(&event.date.format("%Y %m %d").to_string());
+            
+            // Add time if present
+            if let Some(time) = event.time {
+                searchable_text.push(' ');
+                searchable_text.push_str(&time.format("%H:%M").to_string());
+                searchable_text.push(' ');
+                searchable_text.push_str(&time.format("%H %M").to_string());
+            }
+            
+            // Fuzzy match
+            if let Some(score) = matcher.fuzzy_match(&searchable_text, &self.query) {
+                self.results.push(SearchResult {
+                    event_name: event.name.clone(),
+                    date: event.date,
+                    time: event.time,
+                    source: EventSource::Local(idx),
+                    score,
+                });
+            }
+        }
+        
+        // Search through external events
+        for (idx, event) in external_events.iter().enumerate() {
+            // Filter by mode first
+            let include = match self.mode {
+                SearchMode::Future => event.date >= now,
+                SearchMode::Past => event.date < now,
+                SearchMode::All => true,
+            };
+            
+            if !include {
+                continue;
+            }
+            
+            // Build searchable text with metadata
+            let mut searchable_text = event.name.clone();
+            
+            // Add category name
+            searchable_text.push(' ');
+            searchable_text.push_str(event.category.name(config));
+            
+            // Add date
+            searchable_text.push(' ');
+            searchable_text.push_str(&event.date.format("%Y-%m-%d").to_string());
+            searchable_text.push(' ');
+            searchable_text.push_str(&event.date.format("%Y %m %d").to_string());
+            
+            // Add time if present
+            if let Some(time) = event.time {
+                searchable_text.push(' ');
+                searchable_text.push_str(&time.format("%H:%M").to_string());
+                searchable_text.push(' ');
+                searchable_text.push_str(&time.format("%H %M").to_string());
+            }
+            
+            // Fuzzy match
+            if let Some(score) = matcher.fuzzy_match(&searchable_text, &self.query) {
+                self.results.push(SearchResult {
+                    event_name: event.name.clone(),
+                    date: event.date,
+                    time: event.time,
+                    source: EventSource::External(idx),
+                    score,
+                });
+            }
+        }
+        
+        // Sort results by score (descending), then by date/time
+        self.results.sort_by(|a, b| {
+            let score_cmp = b.score.cmp(&a.score); // Higher score first
+            if score_cmp != std::cmp::Ordering::Equal {
+                score_cmp
+            } else {
+                let date_cmp = a.date.cmp(&b.date);
+                if date_cmp != std::cmp::Ordering::Equal {
+                    date_cmp
+                } else {
+                    // Within same date, sort by time (None comes first)
+                    match (a.time, b.time) {
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (Some(t1), Some(t2)) => t1.cmp(&t2),
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                }
+            }
+        });
+        
+        // For past events, keep score-based sorting but reverse date order within same score
+        if self.mode == SearchMode::Past {
+            self.results.sort_by(|a, b| {
+                let score_cmp = b.score.cmp(&a.score);
+                if score_cmp != std::cmp::Ordering::Equal {
+                    score_cmp
+                } else {
+                    // Reverse date order for past events
+                    let date_cmp = b.date.cmp(&a.date);
+                    if date_cmp != std::cmp::Ordering::Equal {
+                        date_cmp
+                    } else {
+                        match (b.time, a.time) {
+                            (None, Some(_)) => std::cmp::Ordering::Less,
+                            (Some(_), None) => std::cmp::Ordering::Greater,
+                            (Some(t1), Some(t2)) => t1.cmp(&t2),
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    }
+                }
+            });
+        }
+    }
+    
+    fn move_selection(&mut self, delta: i32) {
+        if self.results.is_empty() {
+            return;
+        }
+        
+        let new_index = self.selected_index as i32 + delta;
+        if new_index >= 0 && new_index < self.results.len() as i32 {
+            self.selected_index = new_index as usize;
+        }
+    }
+    
+    fn get_selected_date(&self) -> Option<NaiveDate> {
+        self.results.get(self.selected_index).map(|r| r.date)
+    }
 }
 
 struct EventForm {
@@ -814,7 +1080,133 @@ impl App {
             show_event_numbers: false,
             show_delete_numbers: false,
             config,
+            search_state: SearchState::new(),
         }
+    }
+    
+    fn export_to_ics(&self) -> Result<(), String> {
+        let mut ics_content = String::new();
+        
+        // ICS header
+        ics_content.push_str("BEGIN:VCALENDAR\r\n");
+        ics_content.push_str("VERSION:2.0\r\n");
+        ics_content.push_str("PRODID:-//calcite//calcite TUI Calendar//EN\r\n");
+        ics_content.push_str("CALSCALE:GREGORIAN\r\n");
+        
+        // Export each local event
+        for (idx, event) in self.local_events.iter().enumerate() {
+            ics_content.push_str("BEGIN:VEVENT\r\n");
+            
+            // UID (unique identifier)
+            let uid = format!("calcite-{}-{}@localhost", event.date.format("%Y%m%d"), idx);
+            ics_content.push_str(&format!("UID:{}\r\n", uid));
+            
+            // SUMMARY (event name)
+            ics_content.push_str(&format!("SUMMARY:{}\r\n", event.name));
+            
+            // DTSTART (start date/time)
+            if let Some(time) = event.time {
+                let dtstart = format!("{}T{}", 
+                    event.date.format("%Y%m%d"),
+                    time.format("%H%M%S"));
+                ics_content.push_str(&format!("DTSTART:{}\r\n", dtstart));
+            } else {
+                // All-day event
+                let dtstart = event.date.format("%Y%m%d");
+                ics_content.push_str(&format!("DTSTART;VALUE=DATE:{}\r\n", dtstart));
+            }
+            
+            // DTEND (end date/time)
+            if let Some(end_time) = event.end_time {
+                if event.time.is_some() {
+                    let dtend = format!("{}T{}", 
+                        event.date.format("%Y%m%d"),
+                        end_time.format("%H%M%S"));
+                    ics_content.push_str(&format!("DTEND:{}\r\n", dtend));
+                }
+            } else if event.time.is_none() {
+                // All-day event - end date is next day
+                let end_date = event.date.succ_opt().unwrap_or(event.date);
+                ics_content.push_str(&format!("DTEND;VALUE=DATE:{}\r\n", end_date.format("%Y%m%d")));
+            }
+            
+            // Handle recurrence
+            if let Some(number) = event.number {
+                if number > 1 {
+                    // Use RRULE with COUNT
+                    let freq = match event.repeat {
+                        RepeatInterval::Daily => "DAILY",
+                        RepeatInterval::Weekly => "WEEKLY",
+                        RepeatInterval::Monthly => "MONTHLY",
+                        RepeatInterval::Yearly => "YEARLY",
+                    };
+                    ics_content.push_str(&format!("RRULE:FREQ={};COUNT={}\r\n", freq, number));
+                }
+            } else if let Some(end_date) = event.end_date {
+                // Use RRULE with UNTIL
+                let freq = match event.repeat {
+                    RepeatInterval::Daily => "DAILY",
+                    RepeatInterval::Weekly => "WEEKLY",
+                    RepeatInterval::Monthly => "MONTHLY",
+                    RepeatInterval::Yearly => "YEARLY",
+                };
+                let until = if event.time.is_some() {
+                    format!("{}T235959", end_date.format("%Y%m%d"))
+                } else {
+                    end_date.format("%Y%m%d").to_string()
+                };
+                ics_content.push_str(&format!("RRULE:FREQ={};UNTIL={}\r\n", freq, until));
+            }
+            
+            // CATEGORIES (using category name from config)
+            let category_name = event.category.name(&self.config);
+            ics_content.push_str(&format!("CATEGORIES:{}\r\n", category_name));
+            
+            // DTSTAMP (timestamp of creation - use current time)
+            let now = Local::now();
+            let dtstamp = now.format("%Y%m%dT%H%M%SZ");
+            ics_content.push_str(&format!("DTSTAMP:{}\r\n", dtstamp));
+            
+            ics_content.push_str("END:VEVENT\r\n");
+        }
+        
+        // ICS footer
+        ics_content.push_str("END:VCALENDAR\r\n");
+        
+        // Write to file
+        let export_path = if let Some(path) = &self.config.export_path {
+            let path_str = path.as_str();
+            // Expand ~ to home directory
+            if path_str.starts_with("~/") {
+                if let Some(home) = std::env::var_os("HOME") {
+                    let expanded = path_str.replacen("~/", "", 1);
+                    PathBuf::from(home).join(expanded)
+                } else {
+                    PathBuf::from(path)
+                }
+            } else if path_str == "~" {
+                if let Some(home) = std::env::var_os("HOME") {
+                    PathBuf::from(home)
+                } else {
+                    PathBuf::from(path)
+                }
+            } else {
+                PathBuf::from(path)
+            }
+        } else {
+            PathBuf::from("calendar.ics")
+        };
+        
+        // Validate that the parent directory exists (if path has a parent)
+        if let Some(parent) = export_path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return Err(format!("Directory does not exist: {}", parent.display()));
+            }
+        }
+        
+        fs::write(&export_path, ics_content).map_err(|e| e.to_string())?;
+        
+        Ok(())
     }
     
     fn move_selection(&mut self, dx: i32, dy: i32) {
@@ -1115,7 +1507,10 @@ fn run_app<B: ratatui::backend::Backend>(
         if let Event::Key(key) = event::read()? {
             match app.input_mode {
                 InputMode::Normal => match key.code {
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        let _ = app.export_to_ics();
+                        return Ok(());
+                    }
                     KeyCode::Char('a') => {
                         app.event_form = EventForm::new(app.selected_date);
                         app.input_mode = InputMode::EventPopup;
@@ -1130,6 +1525,15 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Char('i') => {
                         app.input_mode = InputMode::ShowingInfo;
+                    }
+                    KeyCode::Char('E') => {
+                        if let Err(e) = app.export_to_ics() {
+                            eprintln!("Failed to export calendar: {}", e);
+                        }
+                    }
+                    KeyCode::Char('/') => {
+                        app.search_state = SearchState::new();
+                        app.input_mode = InputMode::Searching;
                     }
                     KeyCode::Char(c) if c.is_ascii_digit() && app.show_event_numbers => {
                         let digit = c.to_digit(10).unwrap() as usize;
@@ -1203,8 +1607,24 @@ fn run_app<B: ratatui::backend::Backend>(
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
                         let today = Local::now().date_naive();
-                        *app = App::with_date(today);
-                        app.load_events();
+                        
+                        // Only update the view if we're not already on today
+                        if app.selected_date != today {
+                            // If moving to different month, update month view
+                            if today.month() != app.current_month || today.year() != app.current_year {
+                                let local_events = std::mem::take(&mut app.local_events);
+                                let external_events = std::mem::take(&mut app.external_events);
+                                let config = app.config.clone();
+                                *app = App::with_date(today);
+                                app.local_events = local_events;
+                                app.external_events = external_events;
+                                app.expand_events();
+                                app.config = config;
+                            } else {
+                                // Same month, just update selected date
+                                app.selected_date = today;
+                            }
+                        }
                     }
                     _ => {}
                 },
@@ -1332,6 +1752,45 @@ fn run_app<B: ratatui::backend::Backend>(
                         _ => {}
                     }
                 }
+                InputMode::Searching => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Tab => {
+                            app.search_state.cycle_mode();
+                            app.search_state.update_results(&app.local_events, &app.external_events, &app.config);
+                        }
+                        KeyCode::Enter => {
+                            if let Some(date) = app.search_state.get_selected_date() {
+                                let local_events = std::mem::take(&mut app.local_events);
+                                let external_events = std::mem::take(&mut app.external_events);
+                                let config = app.config.clone();
+                                *app = App::with_date(date);
+                                app.local_events = local_events;
+                                app.external_events = external_events;
+                                app.expand_events();
+                                app.config = config;
+                                app.input_mode = InputMode::Normal;
+                            }
+                        }
+                        KeyCode::Up => {
+                            app.search_state.move_selection(-1);
+                        }
+                        KeyCode::Down => {
+                            app.search_state.move_selection(1);
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_state.query.push(c);
+                            app.search_state.update_results(&app.local_events, &app.external_events, &app.config);
+                        }
+                        KeyCode::Backspace => {
+                            app.search_state.query.pop();
+                            app.search_state.update_results(&app.local_events, &app.external_events, &app.config);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -1340,29 +1799,17 @@ fn run_app<B: ratatui::backend::Backend>(
 fn ui(f: &mut ratatui::Frame, app: &App) {
     let size = f.area();
     
-    // Split into main area and footer
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(size);
-    
-    // Split main area into two columns
+    // Split main area into two columns (no footer)
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_chunks[0]);
+        .split(size);
     
     // Left column: Calendar
     render_calendar(f, app, chunks[0]);
     
     // Right column: Selected date info
     render_date_info(f, app, chunks[1]);
-    
-    // Render footer with keybinding hints
-    let footer_text = " a: add event | e: edit | r: remove | Space: today | i: info | q: quit ";
-    let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, main_chunks[1]);
     
     // Render popup if in input mode
     if app.input_mode == InputMode::EventPopup {
@@ -1371,6 +1818,8 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         render_delete_confirmation(f, app, index);
     } else if app.input_mode == InputMode::ShowingInfo {
         render_info_popup(f, app);
+    } else if app.input_mode == InputMode::Searching {
+        render_search_popup(f, app);
     }
 }
 
@@ -1385,7 +1834,7 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
     
     let header_cells = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         .iter()
-        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::DarkGray)));
     let header = Row::new(header_cells).height(1);
     
     let mut rows = vec![];
@@ -1418,6 +1867,7 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
                 
                 let is_current_month = cell_date.month() == app.current_month;
                 let is_selected = cell_date == app.selected_date;
+                let is_today = cell_date == Local::now().date_naive();
                 
                 // Get events for this date
                 let events = app.events.get(&cell_date);
@@ -1427,14 +1877,23 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
                 
                 // First line: day number
                 let day_style = if is_selected {
-                    Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else if is_today {
+                    Style::default().add_modifier(Modifier::BOLD)
                 } else if !is_current_month {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default()
                 };
                 
-                lines.push(Line::from(Span::styled(format!("{:2}", cell_date.day()), day_style)));
+                if is_today {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}", cell_date.day()), day_style),
+                        Span::styled(" 󰃮", Style::default().fg(Color::White)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("{}", cell_date.day()), day_style)));
+                }
                 
                 // Add event indicator lines (colored bars) - sorted like day view
                 if let Some(event_sources) = events {
@@ -1478,10 +1937,8 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
                     for event in timed_events.iter().take(max_indicators.saturating_sub(lines_used)) {
                         if let Some(start_time) = event.time {
                             let time_str = start_time.format("%H:%M").to_string();
-                            let bullet_style = Style::default().fg(event.category.color(&app.config));
-                            let time_style = Style::default().fg(Color::White);
+                            let time_style = Style::default().fg(event.category.color(&app.config));
                             lines.push(Line::from(vec![
-                                Span::styled("● ", bullet_style),
                                 Span::styled(time_str, time_style),
                             ]));
                         }
@@ -1491,7 +1948,7 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
                 // Pad with empty lines to fill row height
                 while lines.len() < row_height as usize {
                     let empty_style = if is_selected {
-                        Style::default().bg(Color::Blue)
+                        Style::default().bg(Color::DarkGray)
                     } else {
                         Style::default()
                     };
@@ -1501,7 +1958,7 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
                 // Create cell with background color if selected
                 let mut cell = Cell::from(lines);
                 if is_selected {
-                    cell = cell.style(Style::default().bg(Color::Blue));
+                    cell = cell.style(Style::default().bg(Color::DarkGray));
                 }
                 cell
             })
@@ -1520,15 +1977,59 @@ fn render_calendar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rec
         Constraint::Percentage(15),
     ];
     
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(" {} ", title)).padding(ratatui::widgets::Padding::uniform(1)));
+    // Create block with no bottom padding so keybinds touch the border
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", title))
+        .padding(ratatui::widgets::Padding {
+            left: 1,
+            right: 0,
+            top: 1,
+            bottom: 0,
+        });
     
-    f.render_widget(table, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    
+    // Split inner area to add keybinds at bottom inside the border
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    
+    let table = Table::new(rows, widths)
+        .header(header);
+    
+    f.render_widget(table, chunks[0]);
+    
+    // Render keybinds at bottom inside the border
+    let keybinds = Paragraph::new("/: search | E: export | Space: today | i: info | q: quit")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(keybinds, chunks[1]);
 }
 
 fn render_date_info(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let title = format!(" {} ", app.selected_date.format("%A %d").to_string());
+    
+    // Create block with no bottom padding so keybinds touch the border
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.clone())
+        .padding(ratatui::widgets::Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        });
+    
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    
+    // Split inner area to add keybinds at bottom inside the border
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
     
     let events_list = app.get_sorted_events(&app.selected_date);
     let sources = app.get_sorted_event_sources(&app.selected_date);
@@ -1536,9 +2037,8 @@ fn render_date_info(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
     if events_list.is_empty() {
         // No events - show empty message
         let info = Paragraph::new("No events")
-            .block(Block::default().borders(Borders::ALL).title(title).padding(ratatui::widgets::Padding::uniform(1)))
             .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(info, area);
+        f.render_widget(info, chunks[0]);
     } else {
         // Build table rows with spacing between all-day and timed events
         let mut rows: Vec<Row> = Vec::new();
@@ -1598,11 +2098,15 @@ fn render_date_info(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
         ];
         
         let table = Table::new(rows, widths)
-            .block(Block::default().borders(Borders::ALL).title(title).padding(ratatui::widgets::Padding::uniform(1)))
             .style(Style::default().fg(Color::White));
         
-        f.render_widget(table, area);
+        f.render_widget(table, chunks[0]);
     }
+    
+    // Render keybinds at bottom inside the border
+    let keybinds = Paragraph::new("a: add | e: edit | r: remove")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(keybinds, chunks[1]);
 }
 
 fn render_event_popup(f: &mut ratatui::Frame, app: &App) {
@@ -1645,7 +2149,12 @@ fn render_event_popup(f: &mut ratatui::Frame, app: &App) {
         .borders(Borders::ALL)
         .title(ratatui::text::Span::styled(title, title_style))
         .style(Style::default().bg(Color::Reset).fg(Color::White))
-        .padding(ratatui::widgets::Padding::uniform(1));
+        .padding(ratatui::widgets::Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        });
     
     f.render_widget(block.clone(), popup_area);
     
@@ -1915,9 +2424,7 @@ fn render_delete_confirmation(f: &mut ratatui::Frame, app: &App, event_index: us
     };
     
     // Clear the popup area with background
-    let clear_block = Block::default()
-        .style(Style::default().bg(Color::Reset));
-    f.render_widget(clear_block, popup_area);
+    f.render_widget(ratatui::widgets::Clear, popup_area);
     
     // Build confirmation message
     let lines = vec![
@@ -1936,7 +2443,7 @@ fn render_delete_confirmation(f: &mut ratatui::Frame, app: &App, event_index: us
     ];
     
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Confirm Deletion"))
+        .block(Block::default().borders(Borders::ALL).title(" Confirm Deletion "))
         .style(Style::default().bg(Color::Reset));
     
     f.render_widget(paragraph, popup_area);
@@ -2012,10 +2519,155 @@ fn render_info_popup(f: &mut ratatui::Frame, app: &App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .style(Style::default().bg(Color::Reset).fg(Color::White))
-                .padding(ratatui::widgets::Padding::uniform(1))
+                .padding(ratatui::widgets::Padding {
+                    left: 1,
+                    right: 1,
+                    top: 1,
+                    bottom: 0,
+                })
         );
     
     f.render_widget(paragraph, popup_area);
+}
+
+fn render_search_popup(f: &mut ratatui::Frame, app: &App) {
+    use ratatui::text::{Line, Span};
+    
+    let area = f.area();
+    
+    // Calculate popup size (centered)
+    let popup_width = 70.min(area.width - 4);
+    let popup_height = 20.min(area.height - 4);
+    let popup_x = (area.width - popup_width) / 2;
+    let popup_y = (area.height - popup_height) / 2;
+    
+    let popup_area = ratatui::layout::Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+    
+    // Clear the area behind the popup to prevent bleed-through
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+    
+    // Create popup border with padding only on top, left, and right (not bottom)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Search Events ")
+        .style(Style::default().bg(Color::Reset).fg(Color::White))
+        .padding(ratatui::widgets::Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        });
+    
+    f.render_widget(block.clone(), popup_area);
+    
+    let inner = block.inner(popup_area);
+    
+    // Split into search input and results
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Search input
+            Constraint::Min(0),    // Results list
+            Constraint::Length(1), // Empty line before help
+            Constraint::Length(1), // Help text
+        ])
+        .split(inner);
+    
+    // Render search input with mode indicator
+    let query_display = if app.search_state.query.is_empty() {
+        "Type to search..."
+    } else {
+        &app.search_state.query
+    };
+    
+    let query_style = if app.search_state.query.is_empty() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::White).bg(Color::Blue)
+    };
+    
+    let mode_str = app.search_state.mode.to_string();
+    let mode_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    
+    let query_line = Line::from(vec![
+        Span::styled("Search [", Style::default().fg(Color::White)),
+        Span::styled(mode_str, mode_style),
+        Span::styled("]: ", Style::default().fg(Color::White)),
+        Span::styled(query_display, query_style),
+    ]);
+    
+    let query_para = Paragraph::new(query_line);
+    f.render_widget(query_para, layout[0]);
+    
+    // Render results
+    if app.search_state.results.is_empty() {
+        if !app.search_state.query.is_empty() {
+            let no_results = Paragraph::new("No results found")
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(no_results, layout[1]);
+        }
+    } else {
+        let mut rows = Vec::new();
+        
+        for (idx, result) in app.search_state.results.iter().enumerate() {
+            let is_selected = idx == app.search_state.selected_index;
+            
+            let event = app.get_event(&result.source);
+            let date_str = result.date.format("%Y-%m-%d").to_string();
+            
+            let time_str = if let Some(time) = result.time {
+                time.format("%H:%M").to_string()
+            } else {
+                "All day".to_string()
+            };
+            
+            let style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            
+            let event_color = event.category.color(&app.config);
+            
+            rows.push(Row::new(vec![
+                Cell::from(date_str).style(style),
+                Cell::from(time_str).style(style),
+                Cell::from(result.event_name.as_str()).style(if is_selected {
+                    Style::default().bg(Color::Blue).fg(event_color)
+                } else {
+                    Style::default().fg(event_color)
+                }),
+            ]).height(1));
+        }
+        
+        let widths = [
+            Constraint::Length(12),  // Date
+            Constraint::Length(10),  // Time
+            Constraint::Min(20),     // Event name
+        ];
+        
+        let table = Table::new(rows, widths)
+            .style(Style::default());
+        
+        f.render_widget(table, layout[1]);
+    }
+    
+    // Help text (layout[2] is the empty line, layout[3] is the help text)
+    let help = Paragraph::new("↑↓: navigate | Tab: cycle mode | Enter: select | Esc: cancel")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(help, layout[3]);
+    
+    // Position cursor after search input - adjust for new prompt format
+    // "Search [" = 8, mode string, "]: " = 3, then query position
+    let mode_str = app.search_state.mode.to_string();
+    let cursor_x = layout[0].x + 8 + mode_str.len() as u16 + 3 + app.search_state.query.len() as u16;
+    let cursor_y = layout[0].y;
+    f.set_cursor_position((cursor_x, cursor_y));
 }
 
 

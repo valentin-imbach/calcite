@@ -1,4 +1,4 @@
-# vCal - Terminal Calendar
+# calcite - Terminal Calendar
 
 A feature-rich TUI calendar application built with Rust and Ratatui.
 
@@ -35,6 +35,11 @@ A feature-rich TUI calendar application built with Rust and Ratatui.
 Create a `config.toml` file in the working directory to customize:
 
 ```toml
+# Optional: Filter external calendar events by year range
+# If not specified, all events are loaded
+min_year = 2020  # Only load events from 2020 onwards
+max_year = 2030  # Only load events up to 2030
+
 [[categories]]
 number = 1
 name = "Work"

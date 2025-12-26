@@ -1,5 +1,5 @@
 [package]
-name = "vcal"
+name = "calcite"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,3 +11,4 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 reqwest = { version = "0.11", features = ["blocking"] }
 ical = "0.11"
+fuzzy-matcher = "0.3.7"
