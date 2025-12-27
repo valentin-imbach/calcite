@@ -1,0 +1,81 @@
+# Calcite Calendar Configuration
+# Place at: ~/.config/calcite/config.toml
+
+# =============================================================================
+# CATEGORIES (up to 9)
+# =============================================================================
+# Define event categories with names and colors
+# Access by number (1-9) when creating events
+#
+# Available colors: Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray, White,
+#                   DarkGray, LightRed, LightGreen, LightYellow, LightBlue, 
+#                   LightMagenta, LightCyan, Orange, Brown, Teal
+
+[[categories]]
+name = "Work"
+color = "Blue"
+
+[[categories]]
+name = "Personal"
+color = "Green"
+
+[[categories]]
+name = "Health"
+color = "Red"
+
+[[categories]]
+name = "Social"
+color = "Magenta"
+
+[[categories]]
+name = "Finance"
+color = "Yellow"
+
+[[categories]]
+name = "Education"
+color = "Cyan"
+
+[[categories]]
+name = "Travel"
+color = "LightBlue"
+
+[[categories]]
+name = "Shopping"
+color = "LightGreen"
+
+[[categories]]
+name = "Other"
+color = "Gray"
+
+# =============================================================================
+# ICS CALENDAR IMPORTS (optional)
+# =============================================================================
+# Import external calendars from ICS/iCal URLs
+# Events are read-only and assigned to a category
+
+# [[ics_calendars]]
+# url = "https://calendar.google.com/calendar/ical/YOUR_CALENDAR_ID/public/basic.ics"
+# category = 1  # Assigns to category 1 (Work)
+
+# =============================================================================
+# YEAR FILTERING (optional)
+# =============================================================================
+# Filter imported ICS events by year range
+
+# min_year = 2024
+# max_year = 2030
+
+# =============================================================================
+# EXPORT CONFIGURATION (optional)
+# =============================================================================
+# Configure ICS export (happens when you quit with 'q')
+
+# Export directory (default: ~/.config/calcite/)
+# Supports ~/ expansion, relative paths (to config dir), or absolute paths
+# export_path = "~/Documents/calendars"
+
+# Export filename with timestamp formatting (default: "calendar.ics")
+# Use chrono format specifiers: %Y %m %d %H %M %S %B %b %A %a
+export_filename = "calendar.ics"
+# export_filename = "backup_%Y%m%d_%H%M%S.ics"  # Example with timestamp
+

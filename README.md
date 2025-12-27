@@ -30,40 +30,68 @@ A feature-rich TUI calendar application built with Rust and Ratatui.
 
 - **Storage**: Local events stored in `events.toml`, auto-saved on changes
 
-## Configuration
+## Installation
 
-Create a `config.toml` file in the working directory to customize:
+### From Source
 
-```toml
-# Optional: Filter external calendar events by year range
-# If not specified, all events are loaded
-min_year = 2020  # Only load events from 2020 onwards
-max_year = 2030  # Only load events up to 2030
+```bash
+# Clone the repository
+git clone <repository-url>
+cd calcite
 
-[[categories]]
-number = 1
-name = "Work"
-color = "Blue"
+# Install with cargo
+cargo install --path .
 
-[[categories]]
-number = 2
-name = "Personal"
-color = "Green"
-
-# ... up to 9 categories
-
-[[ics_calendars]]
-name = "My Calendar"
-url = "https://example.com/calendar.ics"
-category = 1
+# Or run directly
+cargo run --release
 ```
 
-**Available colors**: Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray, DarkGray, LightRed, LightGreen, LightYellow, LightBlue, LightMagenta, LightCyan, White, Orange, Brown, Teal
+### Via Cargo (when published)
+
+```bash
+cargo install calcite
+```
+
+## Configuration
+
+Configuration files are stored in `~/.config/calcite/`:
+
+- **config.toml**: Categories, external calendars, export settings
+- **events.toml**: Local events storage (auto-saved)
+
+See the example `config.toml` in the repository for all available options.
 
 ## Usage
 
+### TUI Mode (default)
+
 ```bash
-cargo run
+calcite                      # Open calendar with today's date
+calcite --date 2025-01-15    # Open with specific date selected
+calcite -d 2025-01-15        # Short form
+```
+
+### Command-Line Mode
+
+```bash
+# Show events for today
+calcite --summary
+calcite -s
+
+# Show events for a specific date
+calcite --summary --date 2025-01-15
+calcite -s -d 2025-01-15
+
+# List next 5 upcoming events (default)
+calcite --list
+calcite -l
+
+# List next 10 upcoming events
+calcite --list 10
+calcite -l 10
+
+# List upcoming events from a specific date
+calcite -l 5 -d 2025-01-15
 ```
 
 ## Controls
@@ -111,27 +139,15 @@ cargo run
 - `toml`: TOML file parsing
 - `ical`: ICS calendar parsing
 - `reqwest`: HTTP client for fetching external calendars
-
-## Installation & Usage
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd vCal
-
-# Run the application
-cargo run --release
-```
-
-## File Locations
-
-- **config.toml**: Configuration file (categories, external calendars) - current working directory
-- **events.toml**: Local events storage - current working directory
+- `clap`: Command-line argument parser
+- `dirs`: System directory paths
+- `fuzzy-matcher`: Fuzzy search functionality
 
 ## Roadmap
 
 - [ ] Week/year views
 - [ ] Event search and filtering
 - [ ] Recurring event exceptions
-- [ ] Export to ICS format
+- [x] Export to ICS format
+- [x] Command-line interface for quick queries
 - [ ] Custom keybindings

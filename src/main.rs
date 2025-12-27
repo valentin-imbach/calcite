@@ -1,4 +1,5 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
+use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -18,6 +19,37 @@ use std::io;
 use std::path::PathBuf;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
+
+#[derive(Parser)]
+#[command(name = "calcite")]
+#[command(about = "A TUI calendar application", long_about = None)]
+struct Args {
+    /// Date to select on startup (format: YYYY-MM-DD)
+    #[arg(short, long, value_name = "DATE")]
+    date: Option<String>,
+    
+    /// Print a summary of events for the date and exit
+    #[arg(short, long)]
+    summary: bool,
+    
+    /// List the next N upcoming events starting from today or specified date
+    #[arg(short, long, value_name = "COUNT", default_missing_value = "5", num_args = 0..=1)]
+    list: Option<Option<usize>>,
+}
+
+fn config_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".config/calcite"))
+        .expect("Failed to get home directory")
+}
+
+fn ensure_config_dir() -> io::Result<()> {
+    let dir = config_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum EventCategory {
@@ -75,17 +107,17 @@ struct Config {
     max_year: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     export_path: Option<String>,
-    #[serde(default = "default_timezone")]
-    timezone: String,
+    #[serde(default = "default_export_filename")]
+    export_filename: String,
 }
 
-fn default_timezone() -> String {
-    "Europe/Zurich".to_string()
+fn default_export_filename() -> String {
+    "calendar.ics".to_string()
 }
 
 impl Config {
     fn load() -> Self {
-        let config_path = PathBuf::from("config.toml");
+        let config_path = config_dir().join("config.toml");
         if config_path.exists() {
             if let Ok(content) = fs::read_to_string(&config_path) {
                 if let Ok(config) = toml::from_str::<Config>(&content) {
@@ -117,7 +149,7 @@ impl Default for Config {
             min_year: None,
             max_year: None,
             export_path: None,
-            timezone: default_timezone(),
+            export_filename: default_export_filename(),
         }
     }
 }
@@ -1042,13 +1074,6 @@ impl EventForm {
 }
 
 impl App {
-    fn new() -> App {
-        let now = Local::now();
-        let mut app = App::with_date(now.date_naive());
-        app.load_events();
-        app
-    }
-    
     fn with_date(date: NaiveDate) -> App {
         let year = date.year();
         let month = date.month();
@@ -1173,8 +1198,14 @@ impl App {
         // ICS footer
         ics_content.push_str("END:VCALENDAR\r\n");
         
-        // Write to file
-        let export_path = if let Some(path) = &self.config.export_path {
+        // Build filename with timestamp formatting
+        let filename = {
+            let now = Local::now();
+            now.format(&self.config.export_filename).to_string()
+        };
+        
+        // Write to file - use config directory if no export_path specified
+        let export_dir = if let Some(path) = &self.config.export_path {
             let path_str = path.as_str();
             // Expand ~ to home directory
             if path_str.starts_with("~/") {
@@ -1191,11 +1222,18 @@ impl App {
                     PathBuf::from(path)
                 }
             } else {
-                PathBuf::from(path)
+                // Treat relative paths as relative to config directory
+                if PathBuf::from(path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    config_dir().join(path)
+                }
             }
         } else {
-            PathBuf::from("calendar.ics")
+            config_dir()
         };
+        
+        let export_path = export_dir.join(&filename);
         
         // Validate that the parent directory exists (if path has a parent)
         if let Some(parent) = export_path.parent() {
@@ -1264,7 +1302,7 @@ impl App {
     }
 
     fn events_file() -> PathBuf {
-        PathBuf::from("events.toml")
+        config_dir().join("events.toml")
     }
 
     fn load_events(&mut self) {
@@ -1473,13 +1511,49 @@ impl App {
 }
 
 fn main() -> Result<(), io::Error> {
+    let args = Args::parse();
+    
+    ensure_config_dir()?;
+    
+    // Parse the target date
+    let target_date = if let Some(date_str) = &args.date {
+        match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            Ok(date) => date,
+            Err(_) => {
+                eprintln!("Error: Invalid date format. Use YYYY-MM-DD (e.g., 2024-12-26)");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Local::now().date_naive()
+    };
+    
+    // If summary mode, print summary and exit
+    if args.summary {
+        let mut app = App::with_date(target_date);
+        app.load_events();
+        print_summary(&app, target_date);
+        return Ok(());
+    }
+    
+    // If list mode, print upcoming events and exit
+    if let Some(count_opt) = args.list {
+        let count = count_opt.unwrap_or(5);
+        let mut app = App::with_date(target_date);
+        app.load_events();
+        print_list(&app, target_date, count);
+        return Ok(());
+    }
+    
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::with_date(target_date);
+    app.load_events();
+    
     let res = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -1495,6 +1569,107 @@ fn main() -> Result<(), io::Error> {
     }
 
     Ok(())
+}
+
+fn print_summary(app: &App, date: NaiveDate) {
+    let config = &app.config;
+    
+    let events = app.get_sorted_events(&date);
+    
+    if events.is_empty() {
+        println!("No events scheduled for this day.");
+    } else {
+        for event in events {
+            let category_color = event.category.color(config);
+            
+            // Format time with fixed width for alignment (17 chars total)
+            let time_str = if let Some(time) = event.time {
+                if let Some(end_time) = event.end_time {
+                    format!("{} - {}", time.format("%H:%M"), end_time.format("%H:%M"))
+                } else {
+                    format!("{}", time.format("%H:%M"))
+                }
+            } else {
+                "All day".to_string()
+            };
+            
+            print_colored_line(&time_str, &event.name, category_color, 17);
+        }
+    }
+}
+
+fn print_list(app: &App, start_date: NaiveDate, count: usize) {
+    let config = &app.config;
+    
+    // Collect all events starting from start_date
+    let mut upcoming_events: Vec<(NaiveDate, &CalendarEvent)> = Vec::new();
+    
+    // Search through the next year of dates to find upcoming events
+    let mut current_date = start_date;
+    let end_search_date = start_date + chrono::Days::new(365);
+    
+    while current_date <= end_search_date && upcoming_events.len() < count {
+        let events = app.get_sorted_events(&current_date);
+        for event in events {
+            upcoming_events.push((current_date, event));
+            if upcoming_events.len() >= count {
+                break;
+            }
+        }
+        current_date = current_date.succ_opt().unwrap_or(current_date);
+    }
+    
+    if upcoming_events.is_empty() {
+        println!("No upcoming events found.");
+    } else {
+        for (date, event) in upcoming_events {
+            let category_color = event.category.color(config);
+            
+            let time_str = if let Some(time) = event.time {
+                if let Some(end_time) = event.end_time {
+                    format!("{} - {}", time.format("%H:%M"), end_time.format("%H:%M"))
+                } else {
+                    format!("{}", time.format("%H:%M"))
+                }
+            } else {
+                "All day".to_string()
+            };
+            
+            let date_str = date.format("%a %d %b").to_string();
+            let combined = format!("{}    {}", date_str, time_str);
+            
+            print_colored_line(&combined, &event.name, category_color, 27);
+        }
+    }
+}
+
+fn print_colored_line(prefix: &str, text: &str, color: Color, width: usize) {
+    let padded_prefix = format!("{:<width$}", prefix, width = width);
+    
+    let color_code = match color {
+        Color::Black => 30,
+        Color::Red => 31,
+        Color::Green => 32,
+        Color::Yellow => 33,
+        Color::Blue => 34,
+        Color::Magenta => 35,
+        Color::Cyan => 36,
+        Color::Gray | Color::DarkGray => 90,
+        Color::LightRed => 91,
+        Color::LightGreen => 92,
+        Color::LightYellow => 93,
+        Color::LightBlue => 94,
+        Color::LightMagenta => 95,
+        Color::LightCyan => 96,
+        Color::White => 97,
+        Color::Rgb(r, g, b) => {
+            println!("\x1b[38;2;{};{};{}m{}    {}\x1b[0m", r, g, b, padded_prefix, text);
+            return;
+        }
+        _ => 37,
+    };
+    
+    println!("\x1b[{}m{}    {}\x1b[0m", color_code, padded_prefix, text);
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -2468,16 +2643,15 @@ fn render_info_popup(f: &mut ratatui::Frame, app: &App) {
     };
     
     // Get paths
-    let events_path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("events.toml")
-        .display()
-        .to_string();
-    let config_path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("config.toml")
-        .display()
-        .to_string();
+    let config_dir_path = config_dir();
+    let dir_display = config_dir_path.display().to_string();
+    
+    // Build export path display
+    let export_path_display = if let Some(path) = &app.config.export_path {
+        format!("{}/{}", path, app.config.export_filename)
+    } else {
+        format!("{}/{}", dir_display, app.config.export_filename)
+    };
     
     // Clear the area behind the popup to prevent bleed-through
     f.render_widget(ratatui::widgets::Clear, popup_area);
@@ -2486,7 +2660,7 @@ fn render_info_popup(f: &mut ratatui::Frame, app: &App) {
     let lines = vec![
         Line::from(vec![
             Span::styled("Version: ", Style::default().fg(Color::Gray)),
-            Span::raw("0.1.0-alpha"),
+            Span::raw("calcite 0.2.0-beta"),
         ]),
         Line::from(vec![
             Span::styled("Local Events: ", Style::default().fg(Color::Gray)),
@@ -2503,12 +2677,12 @@ fn render_info_popup(f: &mut ratatui::Frame, app: &App) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Events Path: ", Style::default().fg(Color::Gray)),
-            Span::raw(events_path),
+            Span::styled("Local Directory: ", Style::default().fg(Color::Gray)),
+            Span::raw(dir_display),
         ]),
         Line::from(vec![
-            Span::styled("Config Path: ", Style::default().fg(Color::Gray)),
-            Span::raw(config_path),
+            Span::styled("Export Path: ", Style::default().fg(Color::Gray)),
+            Span::raw(export_path_display),
         ]),
     ];
     
