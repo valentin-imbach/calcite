@@ -52,10 +52,17 @@ color = "Gray"
 # =============================================================================
 # Import external calendars from ICS/iCal URLs
 # Events are read-only and assigned to a category
+# Set "export = false" to exclude a calendar from .ics exports (default is true)
 
 # [[ics_calendars]]
 # url = "https://calendar.google.com/calendar/ical/YOUR_CALENDAR_ID/public/basic.ics"
 # category = 1  # Assigns to category 1 (Work)
+# export = true # Include in exports (default: true, can be omitted)
+
+# [[ics_calendars]]
+# url = "https://calendar.google.com/calendar/ical/ANOTHER_CALENDAR/public/basic.ics"
+# category = 2  # Assigns to category 2 (Personal)
+# export = false # Exclude from exports
 
 # =============================================================================
 # YEAR FILTERING (optional)
@@ -68,14 +75,12 @@ color = "Gray"
 # =============================================================================
 # EXPORT CONFIGURATION (optional)
 # =============================================================================
-# Configure ICS export (happens when you quit with 'q')
+# Configure ICS export (happens when you press 'E')
 
-# Export directory (default: ~/.config/calcite/)
+# Full path to export file (default: ~/.config/calcite/calendar.ics)
 # Supports ~/ expansion, relative paths (to config dir), or absolute paths
-# export_path = "~/Documents/calendars"
+# Use chrono format specifiers for timestamps: %Y %m %d %H %M %S %B %b %A %a
+# export_path = "~/gdrive/calcite.ics"
+# export_path = "~/Documents/calendar_%Y%m%d.ics"
 
-# Export filename with timestamp formatting (default: "calendar.ics")
-# Use chrono format specifiers: %Y %m %d %H %M %S %B %b %A %a
-export_filename = "calendar.ics"
-# export_filename = "backup_%Y%m%d_%H%M%S.ics"  # Example with timestamp
 

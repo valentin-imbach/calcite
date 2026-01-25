@@ -94,6 +94,12 @@ struct CategoryConfig {
 struct IcsCalendar {
     url: String,
     category: u32,
+    #[serde(default = "default_export")]
+    export: bool,
+}
+
+fn default_export() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -107,12 +113,6 @@ struct Config {
     max_year: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     export_path: Option<String>,
-    #[serde(default = "default_export_filename")]
-    export_filename: String,
-}
-
-fn default_export_filename() -> String {
-    "calendar.ics".to_string()
 }
 
 impl Config {
@@ -149,12 +149,11 @@ impl Default for Config {
             min_year: None,
             max_year: None,
             export_path: None,
-            export_filename: default_export_filename(),
         }
     }
 }
 
-fn fetch_ics_events(config: &Config) -> Vec<CalendarEvent> {
+fn fetch_ics_events(config: &Config) -> Vec<(CalendarEvent, bool)> {
     let mut external_events = Vec::new();
     
     for ics_calendar in &config.ics_calendars {
@@ -162,7 +161,10 @@ fn fetch_ics_events(config: &Config) -> Vec<CalendarEvent> {
             if let Ok(response) = reqwest::blocking::get(&ics_calendar.url) {
                 if let Ok(content) = response.text() {
                     if let Ok(events) = parse_ics_content(&content, category, config.min_year, config.max_year) {
-                        external_events.extend(events);
+                        // Tag each event with the export flag from its calendar
+                        for event in events {
+                            external_events.push((event, ics_calendar.export));
+                        }
                     }
                 }
             }
@@ -432,6 +434,7 @@ struct App {
     events: HashMap<NaiveDate, Vec<EventSource>>, // References to local or external events
     local_events: Vec<CalendarEvent>,
     external_events: Vec<CalendarEvent>,
+    external_events_exportable: Vec<bool>, // Tracks which external events should be exported
     show_event_numbers: bool,
     show_delete_numbers: bool,
     config: Config,
@@ -1102,6 +1105,7 @@ impl App {
             events: HashMap::new(),
             local_events: Vec::new(),
             external_events: Vec::new(),
+            external_events_exportable: Vec::new(),
             show_event_numbers: false,
             show_delete_numbers: false,
             config,
@@ -1195,47 +1199,122 @@ impl App {
             ics_content.push_str("END:VEVENT\r\n");
         }
         
+        // Export external events that are marked as exportable
+        for (idx, (event, exportable)) in self.external_events.iter().zip(&self.external_events_exportable).enumerate() {
+            if !*exportable {
+                continue;
+            }
+            
+            ics_content.push_str("BEGIN:VEVENT\r\n");
+            
+            // UID (unique identifier for external events)
+            let uid = format!("calcite-ext-{}-{}@localhost", event.date.format("%Y%m%d"), idx);
+            ics_content.push_str(&format!("UID:{}\r\n", uid));
+            
+            // SUMMARY (event name)
+            ics_content.push_str(&format!("SUMMARY:{}\r\n", event.name));
+            
+            // DTSTART (start date/time)
+            if let Some(time) = event.time {
+                let dtstart = format!("{}T{}", 
+                    event.date.format("%Y%m%d"),
+                    time.format("%H%M%S"));
+                ics_content.push_str(&format!("DTSTART:{}\r\n", dtstart));
+            } else {
+                // All-day event
+                let dtstart = event.date.format("%Y%m%d");
+                ics_content.push_str(&format!("DTSTART;VALUE=DATE:{}\r\n", dtstart));
+            }
+            
+            // DTEND (end date/time)
+            if let Some(end_time) = event.end_time {
+                if event.time.is_some() {
+                    let dtend = format!("{}T{}", 
+                        event.date.format("%Y%m%d"),
+                        end_time.format("%H%M%S"));
+                    ics_content.push_str(&format!("DTEND:{}\r\n", dtend));
+                }
+            } else if event.time.is_none() {
+                // All-day event - end date is next day
+                let end_date = event.date.succ_opt().unwrap_or(event.date);
+                ics_content.push_str(&format!("DTEND;VALUE=DATE:{}\r\n", end_date.format("%Y%m%d")));
+            }
+            
+            // Handle recurrence
+            if let Some(number) = event.number {
+                if number > 1 {
+                    // Use RRULE with COUNT
+                    let freq = match event.repeat {
+                        RepeatInterval::Daily => "DAILY",
+                        RepeatInterval::Weekly => "WEEKLY",
+                        RepeatInterval::Monthly => "MONTHLY",
+                        RepeatInterval::Yearly => "YEARLY",
+                    };
+                    ics_content.push_str(&format!("RRULE:FREQ={};COUNT={}\r\n", freq, number));
+                }
+            } else if let Some(end_date) = event.end_date {
+                // Use RRULE with UNTIL
+                let freq = match event.repeat {
+                    RepeatInterval::Daily => "DAILY",
+                    RepeatInterval::Weekly => "WEEKLY",
+                    RepeatInterval::Monthly => "MONTHLY",
+                    RepeatInterval::Yearly => "YEARLY",
+                };
+                let until = if event.time.is_some() {
+                    format!("{}T235959", end_date.format("%Y%m%d"))
+                } else {
+                    end_date.format("%Y%m%d").to_string()
+                };
+                ics_content.push_str(&format!("RRULE:FREQ={};UNTIL={}\r\n", freq, until));
+            }
+            
+            // CATEGORIES (using category name from config)
+            let category_name = event.category.name(&self.config);
+            ics_content.push_str(&format!("CATEGORIES:{}\r\n", category_name));
+            
+            // DTSTAMP (timestamp of creation - use current time)
+            let now = Local::now();
+            let dtstamp = now.format("%Y%m%dT%H%M%SZ");
+            ics_content.push_str(&format!("DTSTAMP:{}\r\n", dtstamp));
+            
+            ics_content.push_str("END:VEVENT\r\n");
+        }
+        
         // ICS footer
         ics_content.push_str("END:VCALENDAR\r\n");
         
-        // Build filename with timestamp formatting
-        let filename = {
-            let now = Local::now();
-            now.format(&self.config.export_filename).to_string()
-        };
-        
-        // Write to file - use config directory if no export_path specified
-        let export_dir = if let Some(path) = &self.config.export_path {
+        // Determine export path with timestamp formatting
+        let export_path = if let Some(path) = &self.config.export_path {
             let path_str = path.as_str();
             // Expand ~ to home directory
-            if path_str.starts_with("~/") {
+            let expanded = if path_str.starts_with("~/") {
                 if let Some(home) = std::env::var_os("HOME") {
-                    let expanded = path_str.replacen("~/", "", 1);
-                    PathBuf::from(home).join(expanded)
+                    path_str.replacen("~", &home.to_string_lossy(), 1)
                 } else {
-                    PathBuf::from(path)
+                    path_str.to_string()
                 }
             } else if path_str == "~" {
                 if let Some(home) = std::env::var_os("HOME") {
-                    PathBuf::from(home)
+                    home.to_string_lossy().to_string()
                 } else {
-                    PathBuf::from(path)
+                    path_str.to_string()
                 }
+            } else if PathBuf::from(path_str).is_absolute() {
+                path_str.to_string()
             } else {
-                // Treat relative paths as relative to config directory
-                if PathBuf::from(path).is_absolute() {
-                    PathBuf::from(path)
-                } else {
-                    config_dir().join(path)
-                }
-            }
+                // Relative path - relative to config directory
+                config_dir().join(path_str).to_string_lossy().to_string()
+            };
+            
+            // Apply timestamp formatting
+            let now = Local::now();
+            PathBuf::from(now.format(&expanded).to_string())
         } else {
-            config_dir()
+            // Default: calendar.ics in config directory
+            config_dir().join("calendar.ics")
         };
         
-        let export_path = export_dir.join(&filename);
-        
-        // Validate that the parent directory exists (if path has a parent)
+        // Validate that the parent directory exists
         if let Some(parent) = export_path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 return Err(format!("Directory does not exist: {}", parent.display()));
@@ -1258,10 +1337,12 @@ impl App {
             if self.selected_date.month() != self.current_month || self.selected_date.year() != self.current_year {
                 let local_events = std::mem::take(&mut self.local_events);
                 let external_events = std::mem::take(&mut self.external_events);
+                let external_events_exportable = std::mem::take(&mut self.external_events_exportable);
                 let config = self.config.clone();
                 *self = App::with_date(self.selected_date);
                 self.local_events = local_events;
                 self.external_events = external_events;
+                self.external_events_exportable = external_events_exportable;
                 self.expand_events();
                 self.config = config;
             }
@@ -1293,10 +1374,12 @@ impl App {
         
         let local_events = std::mem::take(&mut self.local_events);
         let external_events = std::mem::take(&mut self.external_events);
+        let external_events_exportable = std::mem::take(&mut self.external_events_exportable);
         let config = self.config.clone();
         *self = App::with_date(new_date);
         self.local_events = local_events;
         self.external_events = external_events;
+        self.external_events_exportable = external_events_exportable;
         self.expand_events();
         self.config = config;
     }
@@ -1317,8 +1400,10 @@ impl App {
             }
         }
         
-        // Fetch external ICS events
-        self.external_events = fetch_ics_events(&self.config);
+        // Fetch external ICS events with export flags
+        let external_events_with_flags = fetch_ics_events(&self.config);
+        self.external_events = external_events_with_flags.iter().map(|(event, _)| event.clone()).collect();
+        self.external_events_exportable = external_events_with_flags.iter().map(|(_, exportable)| *exportable).collect();
         
         self.expand_events();
     }
@@ -1789,10 +1874,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             if today.month() != app.current_month || today.year() != app.current_year {
                                 let local_events = std::mem::take(&mut app.local_events);
                                 let external_events = std::mem::take(&mut app.external_events);
+                                let external_events_exportable = std::mem::take(&mut app.external_events_exportable);
                                 let config = app.config.clone();
                                 *app = App::with_date(today);
                                 app.local_events = local_events;
                                 app.external_events = external_events;
+                                app.external_events_exportable = external_events_exportable;
                                 app.expand_events();
                                 app.config = config;
                             } else {
@@ -1940,10 +2027,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             if let Some(date) = app.search_state.get_selected_date() {
                                 let local_events = std::mem::take(&mut app.local_events);
                                 let external_events = std::mem::take(&mut app.external_events);
+                                let external_events_exportable = std::mem::take(&mut app.external_events_exportable);
                                 let config = app.config.clone();
                                 *app = App::with_date(date);
                                 app.local_events = local_events;
                                 app.external_events = external_events;
+                                app.external_events_exportable = external_events_exportable;
                                 app.expand_events();
                                 app.config = config;
                                 app.input_mode = InputMode::Normal;
@@ -2648,9 +2737,9 @@ fn render_info_popup(f: &mut ratatui::Frame, app: &App) {
     
     // Build export path display
     let export_path_display = if let Some(path) = &app.config.export_path {
-        format!("{}/{}", path, app.config.export_filename)
+        path.to_string()
     } else {
-        format!("{}/{}", dir_display, app.config.export_filename)
+        format!("{}/calendar.ics", dir_display)
     };
     
     // Clear the area behind the popup to prevent bleed-through
