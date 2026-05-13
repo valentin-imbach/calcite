@@ -158,13 +158,32 @@ fn fetch_ics_events(config: &Config) -> Vec<(CalendarEvent, bool)> {
     
     for ics_calendar in &config.ics_calendars {
         if let Some(category) = EventCategory::from_number(ics_calendar.category) {
-            if let Ok(response) = reqwest::blocking::get(&ics_calendar.url) {
-                if let Ok(content) = response.text() {
-                    if let Ok(events) = parse_ics_content(&content, category, config.min_year, config.max_year) {
-                        // Tag each event with the export flag from its calendar
-                        for event in events {
-                            external_events.push((event, ics_calendar.export));
-                        }
+            let content_result = if ics_calendar.url.starts_with("http://") || ics_calendar.url.starts_with("https://") {
+                // URL: fetch from HTTP(S)
+                reqwest::blocking::get(&ics_calendar.url)
+                    .and_then(|response| response.text())
+                    .ok()
+            } else {
+                // Local file path: read from filesystem
+                let path = if ics_calendar.url.starts_with("~/") {
+                    // Expand ~ to home directory
+                    if let Some(home) = std::env::var_os("HOME") {
+                        PathBuf::from(home).join(&ics_calendar.url[2..])
+                    } else {
+                        PathBuf::from(&ics_calendar.url)
+                    }
+                } else {
+                    PathBuf::from(&ics_calendar.url)
+                };
+                
+                fs::read_to_string(path).ok()
+            };
+            
+            if let Some(content) = content_result {
+                if let Ok(events) = parse_ics_content(&content, category, config.min_year, config.max_year) {
+                    // Tag each event with the export flag from its calendar
+                    for event in events {
+                        external_events.push((event, ics_calendar.export));
                     }
                 }
             }
