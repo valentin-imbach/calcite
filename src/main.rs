@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::process::Command;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
@@ -113,6 +114,8 @@ struct Config {
     max_year: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     export_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_command: Option<String>,
 }
 
 impl Config {
@@ -149,6 +152,7 @@ impl Default for Config {
             min_year: None,
             max_year: None,
             export_path: None,
+            sync_command: None,
         }
     }
 }
@@ -456,6 +460,8 @@ struct App {
     external_events_exportable: Vec<bool>, // Tracks which external events should be exported
     show_event_numbers: bool,
     show_delete_numbers: bool,
+    show_yank_numbers: bool,
+    event_clipboard: Option<CalendarEvent>,
     config: Config,
     search_state: SearchState,
 }
@@ -1127,6 +1133,8 @@ impl App {
             external_events_exportable: Vec::new(),
             show_event_numbers: false,
             show_delete_numbers: false,
+            show_yank_numbers: false,
+            event_clipboard: None,
             config,
             search_state: SearchState::new(),
         }
@@ -1344,6 +1352,34 @@ impl App {
         
         Ok(())
     }
+
+    fn run_sync_command(&self) -> Result<(), String> {
+        let Some(command) = self.config.sync_command.as_deref() else {
+            return Ok(());
+        };
+
+        if command.trim().is_empty() {
+            return Ok(());
+        }
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .status()
+            .map_err(|e| format!("Failed to run sync_command: {}", e))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "sync_command exited with status: {}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string())
+            ))
+        }
+    }
     
     fn move_selection(&mut self, dx: i32, dy: i32) {
         let days_delta = dy * 7 + dx;
@@ -1555,6 +1591,35 @@ impl App {
         // Save local events to file
         self.save_local_events()
     }
+
+    fn yank_event(&mut self, date: NaiveDate, index: usize) -> Result<(), String> {
+        let sorted_sources = self.get_sorted_event_sources(&date);
+        let source = sorted_sources
+            .get(index)
+            .ok_or_else(|| "Invalid event index".to_string())?;
+
+        self.event_clipboard = Some(self.get_event(source).clone());
+        Ok(())
+    }
+
+    fn paste_event(&mut self, date: NaiveDate) -> Result<(), String> {
+        let mut event = self
+            .event_clipboard
+            .clone()
+            .ok_or_else(|| "No event has been yanked".to_string())?;
+
+        let date_delta = date.signed_duration_since(event.date);
+        event.date = date;
+        if let Some(end_date) = event.end_date {
+            event.end_date = Some(
+                end_date
+                    .checked_add_signed(date_delta)
+                    .ok_or_else(|| "Pasted event date is out of range".to_string())?,
+            );
+        }
+
+        self.save_event(event)
+    }
     
     fn update_event(&mut self, date: NaiveDate, index: usize, updated_event: CalendarEvent) -> Result<(), String> {
         // Get the sorted list to find the event source
@@ -1667,6 +1732,14 @@ fn main() -> Result<(), io::Error> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+
+    if res.is_ok() {
+        if let Err(e) = app.export_to_ics() {
+            eprintln!("Failed to export calendar: {}", e);
+        } else if let Err(e) = app.run_sync_command() {
+            eprintln!("{}", e);
+        }
+    }
 
     if let Err(err) = res {
         println!("{:?}", err)
@@ -1787,7 +1860,6 @@ fn run_app<B: ratatui::backend::Backend>(
             match app.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') => {
-                        let _ = app.export_to_ics();
                         return Ok(());
                     }
                     KeyCode::Char('a') => {
@@ -1797,10 +1869,21 @@ fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Char('e') => {
                         app.show_event_numbers = !app.show_event_numbers;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                     }
                     KeyCode::Char('r') => {
                         app.show_delete_numbers = !app.show_delete_numbers;
                         app.show_event_numbers = false;
+                        app.show_yank_numbers = false;
+                    }
+                    KeyCode::Char('y') => {
+                        app.show_yank_numbers = !app.show_yank_numbers;
+                        app.show_event_numbers = false;
+                        app.show_delete_numbers = false;
+                    }
+                    KeyCode::Char('p') => {
+                        let _ = app.paste_event(app.selected_date);
+                        app.show_yank_numbers = false;
                     }
                     KeyCode::Char('i') => {
                         app.input_mode = InputMode::ShowingInfo;
@@ -1813,6 +1896,16 @@ fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Char('/') => {
                         app.search_state = SearchState::new();
                         app.input_mode = InputMode::Searching;
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() && app.show_yank_numbers => {
+                        let digit = c.to_digit(10).unwrap() as usize;
+                        let events = app.get_sorted_events(&app.selected_date);
+                        if digit > 0 && digit <= events.len() {
+                            if let Err(e) = app.yank_event(app.selected_date, digit - 1) {
+                                eprintln!("Failed to yank event: {}", e);
+                            }
+                            app.show_yank_numbers = false;
+                        }
                     }
                     KeyCode::Char(c) if c.is_ascii_digit() && app.show_event_numbers => {
                         let digit = c.to_digit(10).unwrap() as usize;
@@ -1853,10 +1946,12 @@ fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Esc => {
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                     }
                     KeyCode::Left => {
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             app.change_month(-1);
                         } else {
@@ -1866,6 +1961,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Right => {
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             app.change_month(1);
                         } else {
@@ -1875,16 +1971,19 @@ fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Up => {
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                         app.move_selection(0, -1);
                     }
                     KeyCode::Down => {
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                         app.move_selection(0, 1);
                     }
                     KeyCode::Char(' ') => {
                         app.show_event_numbers = false;
                         app.show_delete_numbers = false;
+                        app.show_yank_numbers = false;
                         let today = Local::now().date_naive();
                         
                         // Only update the view if we're not already on today
@@ -2343,11 +2442,15 @@ fn render_date_info(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
             let source = &sources[idx];
             let number_cell = match source {
                 EventSource::External(_) => {
-                    // Show external indicator (nerd font calendar icon)
-                    Cell::from("󰃭").style(Style::default().fg(Color::DarkGray))
+                    if app.show_yank_numbers {
+                        Cell::from(format!("{}", idx + 1)).style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                    } else {
+                        // Show external indicator (nerd font calendar icon)
+                        Cell::from("󰃭").style(Style::default().fg(Color::DarkGray))
+                    }
                 }
                 EventSource::Local(_) => {
-                    if app.show_event_numbers || app.show_delete_numbers {
+                    if app.show_event_numbers || app.show_delete_numbers || app.show_yank_numbers {
                         Cell::from(format!("{}", idx + 1)).style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
                     } else {
                         Cell::from("")
@@ -2387,7 +2490,7 @@ fn render_date_info(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Re
     }
     
     // Render keybinds at bottom inside the border
-    let keybinds = Paragraph::new("a: add | e: edit | r: remove")
+    let keybinds = Paragraph::new("a: add | e: edit | r: remove | y: yank | p: paste")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(keybinds, chunks[1]);
 }
@@ -2951,5 +3054,3 @@ fn render_search_popup(f: &mut ratatui::Frame, app: &App) {
     let cursor_y = layout[0].y;
     f.set_cursor_position((cursor_x, cursor_y));
 }
-
-

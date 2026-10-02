@@ -61,6 +61,8 @@ Configuration files are stored in `~/.config/calcite/`:
 
 See the example `config.toml` in the repository for all available options.
 
+You can set `sync_command` in `config.toml` to run a shell command automatically after the quit-time ICS export succeeds.
+
 ## Usage
 
 ### TUI Mode (default)
@@ -105,6 +107,8 @@ calcite -l 5 -d 2025-01-15
 - **a**: Add event to selected date
 - **e**: Show event numbers for editing
 - **r**: Show event numbers for removal
+- **y**: Show event numbers for yanking (copying)
+- **p**: Paste the yanked event to the selected date
 - **i**: Show info/debug popup
 - **q**: Quit application
 
