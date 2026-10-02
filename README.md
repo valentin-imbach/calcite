@@ -3,6 +3,7 @@
 A feature-rich TUI calendar application built with Rust and Ratatui.
 
 > ⚠️ **Note**: This project is in active development. Features and functionality may change.
+> 
 > ⚠️ **Note**: This project was heavily co-written by copilot.
 
 ## Features
